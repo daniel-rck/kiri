@@ -3421,19 +3421,45 @@ impl Engine {
             let mut st = self.lock();
             let c = st.containers.get_mut(&id).ok_or_else(|| gone(&id))?;
             if c.spec.network_mode == net.name {
-                return Err(Error::BadRequest(format!("Kiri cannot disconnect a container from its first network ({})", net.name)));
+                // Running, the first network is the container's eth0 in the
+                // VM, which is not plugged in or out.
+                if c.status == Status::Running {
+                    return Err(Error::BadRequest(format!("Kiri cannot disconnect a running container from its first network ({})", net.name)));
+                }
+                if c.spec.extra_networks.is_empty() {
+                    return Err(Error::BadRequest(format!("Kiri cannot disconnect a container from its only network ({})", net.name)));
+                }
+                // Not running (Aspire's DCP leaves `bridge` before the
+                // start): the next network becomes the first, with its own
+                // aliases and fixed addresses, and the start plugs it in as eth0.
+                let next = c.spec.extra_networks.remove(0);
+                c.spec.network_mode = next.name;
+                c.spec.aliases = next.aliases;
+                c.spec.ipv4_address = next.ipv4_address;
+                c.spec.ipv6_address = next.ipv6_address;
+                c.spec.mac_address = next.mac_address;
+                // Not running, it holds no address; any left goes back all
+                // the same, or the network could never be removed.
+                if let Some(ip) = c.ip.take() {
+                    self.release_ip(&net.name, ip);
+                }
+                if let Some(a) = c.ip6.take() {
+                    self.lock_networks().release6(&net.name, a);
+                }
+                (None, None)
+            } else {
+                let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
+                    return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
+                };
+                c.spec.extra_networks.remove(pos);
+                let ip = c.extra_ips.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ips.remove(i).1);
+                if let Some(i) = c.extra_ip6s.iter().position(|(x, _)| *x == net.name) {
+                    let (_, a) = c.extra_ip6s.remove(i);
+                    self.lock_networks().release6(&net.name, a);
+                }
+                let n = c.extra_ifs.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ifs.remove(i).1);
+                (n, ip)
             }
-            let Some(pos) = c.spec.extra_networks.iter().position(|x| x.name == net.name) else {
-                return Err(Error::NotFound(format!("container {} is not connected to network {}", &id[..12], net.name)));
-            };
-            c.spec.extra_networks.remove(pos);
-            let ip = c.extra_ips.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ips.remove(i).1);
-            if let Some(i) = c.extra_ip6s.iter().position(|(x, _)| *x == net.name) {
-                let (_, a) = c.extra_ip6s.remove(i);
-                self.lock_networks().release6(&net.name, a);
-            }
-            let n = c.extra_ifs.iter().position(|(x, _)| *x == net.name).map(|i| c.extra_ifs.remove(i).1);
-            (n, ip)
         };
         self.save();
         if let Some(ip) = ip {
@@ -5681,6 +5707,45 @@ mod start_wait_tests {
             drop(engine);
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// Aspire's DCP creates a container on `bridge`, connects it to its
+    /// session network and disconnects it from `bridge` before the start.
+    /// While it is not running, the next network takes the first one's
+    /// place, with its own settings; with no other network left, or once
+    /// running, the first network stays.
+    #[test]
+    fn disconnecting_a_stopped_container_from_its_first_network_promotes_the_next() {
+        let (engine, id, dir) = engine("first-net");
+        let ipam = super::super::network::parse_ipam(&serde_json::json!({"Config": [{"Subnet": "10.98.0.0/24"}]})).unwrap();
+        engine.lock_networks().create("session", super::super::network::Settings { ipam, ..Default::default() }).unwrap();
+        {
+            let mut st = engine.lock();
+            let c = st.containers.get_mut(&id).unwrap();
+            c.status = Status::Created;
+            c.spec.network_mode = "bridge".into();
+            c.spec.aliases = vec!["on-bridge".into()];
+        }
+        engine.connect("session", &id, vec!["searxng".into()], "10.98.0.7".into(), String::new(), "02:42:0a:62:00:07".into()).unwrap();
+        engine.disconnect("bridge", &id).expect("a container not running leaves its first network");
+        let (mode, aliases, ip, mac, extra) =
+            engine.with(&id, |c| (c.spec.network_mode.clone(), c.spec.aliases.clone(), c.spec.ipv4_address.clone(), c.spec.mac_address.clone(), c.spec.extra_networks.len())).unwrap();
+        assert_eq!(mode, "session");
+        assert_eq!(aliases, ["searxng"], "the bridge's aliases go with it");
+        assert_eq!(ip, "10.98.0.7");
+        assert_eq!(mac, "02:42:0a:62:00:07");
+        assert_eq!(extra, 0, "the session network is not listed twice");
+        let saved: Vec<Saved> = serde_json::from_slice(&std::fs::read(&engine.records).unwrap()).unwrap();
+        assert_eq!(saved.iter().find(|c| c.name == "first-net").unwrap().spec.network_mode, "session", "the change is saved");
+        let r = engine.disconnect("session", &id);
+        assert!(matches!(r, Err(Error::BadRequest(_))), "the last network stays: {r:?}");
+        engine.connect("bridge", &id, Vec::new(), String::new(), String::new(), String::new()).unwrap();
+        engine.lock().containers.get_mut(&id).unwrap().status = Status::Running;
+        let r = engine.disconnect("session", &id);
+        assert!(matches!(r, Err(Error::BadRequest(_))), "a running container keeps its first network: {r:?}");
+        assert_eq!(engine.with(&id, |c| c.spec.network_mode.clone()).unwrap(), "session");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A second container made with a volume (named or anonymous) that a
